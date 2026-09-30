@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Add a `postcopy-frontend` feature
 ### Changed
 ### Deprecated
 ### Fixed
