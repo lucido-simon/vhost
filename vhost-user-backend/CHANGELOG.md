@@ -9,6 +9,9 @@
 ### Changed
 ### Deprecated
 ### Fixed
+- `SET_MEM_TABLE` or `ADD_MEM_REG` also register the memory regions with userfaultfd and
+  return their bases when the postcopy feature is set, as specified by the spec.
+- `POSTCOPY_LISTEN` no longer registers any memory region by itself.
 
 ## v0.23.0
 

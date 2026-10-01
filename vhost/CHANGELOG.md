@@ -5,10 +5,15 @@
 ### Added
 - Add a `postcopy-frontend` feature
 ### Changed
+- `VhostUserBackendReqHandler::set_mem_table()` and `add_mem_region()` (and their
+  `VhostUserBackendReqHandlerMut` counterparts) return the bases of the backend's mappings while
+  postcopy is listening, and `None` otherwise.
 ### Deprecated
 ### Fixed
 - [[#378]](https://github.com/rust-vmm/vhost/pull/378) Allow `REM_MEM_REG` requests to carry a file
   descriptor for spec compliance against older incorrect implementations.
+- Reply to `SET_MEM_TABLE` and `ADD_MEM_REG` with the backend's mapping bases while postcopy is
+  listening, as defined in the spec.
 
 ## v0.17.0
 

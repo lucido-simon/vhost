@@ -28,9 +28,18 @@ pub struct DummyBackendReqHandler {
     pub inflight_file: Option<File>,
     pub shared_file: Option<File>,
     pub shmem_config: Option<VhostUserShMemConfig>,
+    #[cfg(feature = "postcopy")]
+    pub postcopy_listening: bool,
 }
 
 impl DummyBackendReqHandler {
+    fn postcopy_listening(&self) -> bool {
+        #[cfg(feature = "postcopy")]
+        return self.postcopy_listening;
+        #[cfg(not(feature = "postcopy"))]
+        false
+    }
+
     pub fn new() -> Self {
         DummyBackendReqHandler {
             queue_num: MAX_QUEUE_NUM,
@@ -118,8 +127,16 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(())
     }
 
-    fn set_mem_table(&mut self, _ctx: &[VhostUserMemoryRegion], _files: Vec<File>) -> Result<()> {
-        Ok(())
+    fn set_mem_table(
+        &mut self,
+        ctx: &[VhostUserMemoryRegion],
+        _files: Vec<File>,
+    ) -> Result<Option<Vec<u64>>> {
+        if self.postcopy_listening() {
+            Ok(Some(ctx.iter().map(|region| region.user_addr).collect()))
+        } else {
+            Ok(None)
+        }
     }
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> Result<()> {
@@ -309,8 +326,16 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(MAX_MEM_SLOTS as u64)
     }
 
-    fn add_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion, _fd: File) -> Result<()> {
-        Ok(())
+    fn add_mem_region(
+        &mut self,
+        region: &VhostUserSingleMemoryRegion,
+        _fd: File,
+    ) -> Result<Option<u64>> {
+        if self.postcopy_listening() {
+            Ok(Some(region.user_addr))
+        } else {
+            Ok(None)
+        }
     }
 
     fn remove_mem_region(&mut self, _region: &VhostUserSingleMemoryRegion) -> Result<()> {
@@ -353,13 +378,16 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
 
     #[cfg(feature = "postcopy")]
     fn postcopy_listen(&mut self) -> Result<()> {
+        self.postcopy_listening = true;
         Ok(())
     }
 
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> Result<()> {
+        self.postcopy_listening = false;
         Ok(())
     }
+
     fn set_log_base(&mut self, _log: &VhostUserLog, _file: File) -> Result<()> {
         Ok(())
     }

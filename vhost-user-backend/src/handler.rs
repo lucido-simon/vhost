@@ -105,6 +105,8 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     vrings: Vec<T::Vring>,
     #[cfg(feature = "postcopy")]
     uffd: Option<Uffd>,
+    #[cfg(feature = "postcopy")]
+    postcopy_listening: bool,
     worker_threads: Vec<thread::JoinHandle<VringEpollResult<()>>>,
 }
 
@@ -166,6 +168,8 @@ where
             vrings,
             #[cfg(feature = "postcopy")]
             uffd: None,
+            #[cfg(feature = "postcopy")]
+            postcopy_listening: false,
             worker_threads,
         })
     }
@@ -186,6 +190,26 @@ impl<T: VhostUserBackend> VhostUserHandler<T> {
         }
 
         Err(VhostUserHandlerError::MissingMemoryMapping)
+    }
+
+    // Register a region mapped while postcopy is listening with userfaultfd.This
+    // must happen before the region is visible to the vrings and the backend, or they could
+    // populate pages behind the frontend's back.
+    #[cfg(feature = "postcopy")]
+    fn postcopy_register(&self, mapping: &AddrMapping) -> VhostUserResult<()> {
+        let Some(ref uffd) = self.uffd else {
+            return Err(VhostUserError::ReqHandlerError(io::Error::other(
+                "No registered UFFD handler",
+            )));
+        };
+
+        uffd.register(
+            mapping.local_addr as *mut libc::c_void,
+            mapping.size as usize,
+        )
+        .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
+
+        Ok(())
     }
 }
 
@@ -331,7 +355,7 @@ where
         &mut self,
         ctx: &[VhostUserMemoryRegion],
         files: Vec<File>,
-    ) -> VhostUserResult<()> {
+    ) -> VhostUserResult<Option<Vec<u64>>> {
         // We need to create tuple of ranges from the list of VhostUserMemoryRegion
         // that we get from the caller.
         let mut regions = Vec::new();
@@ -345,13 +369,18 @@ where
             .ok_or(VhostUserError::ReqHandlerError(
                 io::ErrorKind::InvalidInput.into(),
             ))?;
-            mappings.push(AddrMapping {
+            let mapping = AddrMapping {
                 #[cfg(feature = "postcopy")]
                 local_addr: guest_region.as_ptr() as u64,
                 vmm_addr: region.user_addr,
                 size: region.memory_size,
                 gpa_base: region.guest_phys_addr,
-            });
+            };
+            #[cfg(feature = "postcopy")]
+            if self.postcopy_listening {
+                self.postcopy_register(&mapping)?;
+            }
+            mappings.push(mapping);
             regions.push(guest_region);
         }
 
@@ -367,7 +396,17 @@ where
             .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
         self.mappings = mappings;
 
-        Ok(())
+        #[cfg(feature = "postcopy")]
+        if self.postcopy_listening {
+            return Ok(Some(
+                self.mappings
+                    .iter()
+                    .map(|mapping| mapping.local_addr)
+                    .collect(),
+            ));
+        }
+
+        Ok(None)
     }
 
     fn set_vring_num(&mut self, index: u32, num: u32) -> VhostUserResult<()> {
@@ -626,7 +665,7 @@ where
         &mut self,
         region: &VhostUserSingleMemoryRegion,
         file: File,
-    ) -> VhostUserResult<()> {
+    ) -> VhostUserResult<Option<u64>> {
         let guest_region = Arc::new(
             GuestRegionMmap::new(
                 region.mmap_region(file)?,
@@ -644,6 +683,15 @@ where
             size: region.memory_size,
             gpa_base: region.guest_phys_addr,
         };
+        #[cfg(feature = "postcopy")]
+        let base = if self.postcopy_listening {
+            self.postcopy_register(&addr_mapping)?;
+            Some(addr_mapping.local_addr)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "postcopy"))]
+        let base = None;
 
         let mem = self
             .atomic_mem
@@ -659,7 +707,7 @@ where
 
         self.mappings.push(addr_mapping);
 
-        Ok(())
+        Ok(base)
     }
 
     fn remove_mem_region(&mut self, region: &VhostUserSingleMemoryRegion) -> VhostUserResult<()> {
@@ -738,25 +786,25 @@ where
 
     #[cfg(feature = "postcopy")]
     fn postcopy_listen(&mut self) -> VhostUserResult<()> {
-        let Some(ref uffd) = self.uffd else {
+        if self.uffd.is_none() {
             return Err(VhostUserError::ReqHandlerError(io::Error::other(
                 "No registered UFFD handler",
             )));
-        };
-
-        for mapping in self.mappings.iter() {
-            uffd.register(
-                mapping.local_addr as *mut libc::c_void,
-                mapping.size as usize,
-            )
-            .map_err(|e| VhostUserError::ReqHandlerError(io::Error::other(e)))?;
         }
 
+        if !self.mappings.is_empty() {
+            return Err(VhostUserError::InvalidOperation(
+                "memory regions mapped before postcopy listen",
+            ));
+        }
+
+        self.postcopy_listening = true;
         Ok(())
     }
 
     #[cfg(feature = "postcopy")]
     fn postcopy_end(&mut self) -> VhostUserResult<()> {
+        self.postcopy_listening = false;
         self.uffd = None;
         Ok(())
     }
@@ -899,5 +947,74 @@ mod tests {
             events >= 1,
             "Backend SHOULD have been kicked after enabling"
         );
+    }
+
+    // These tests need access to `/dev/userfaultfd`.
+    #[cfg(feature = "postcopy")]
+    mod postcopy {
+        use super::*;
+
+        fn memfd(size: u64) -> File {
+            let fd =
+                nix::sys::memfd::memfd_create("test", nix::sys::memfd::MFdFlags::empty()).unwrap();
+            let file = File::from(fd);
+            file.set_len(size).unwrap();
+            file
+        }
+
+        fn new_handler() -> VhostUserHandler<Arc<Mutex<MockVhostBackend>>> {
+            let mem = GuestMemoryAtomic::new(GuestMemoryMmap::<()>::new());
+            VhostUserHandler::new(Arc::new(Mutex::new(MockVhostBackend::new())), mem).unwrap()
+        }
+
+        // Returns the VmFlags of the mapping starting at `base`.
+        fn vm_flags(base: u64) -> Vec<String> {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+            let header = format!("{base:x}-");
+            // Each mapping's entry ends with its VmFlags.
+            smaps
+                .lines()
+                .skip_while(|line| !line.starts_with(&header))
+                .find_map(|line| line.strip_prefix("VmFlags:"))
+                .unwrap()
+                .split_whitespace()
+                .map(String::from)
+                .collect()
+        }
+
+        #[test]
+        fn test_listen_refused_with_mapped_regions() {
+            let mut handler = new_handler();
+            let region = VhostUserMemoryRegion::new(0x100000, 0x10000, 0x7000_0000, 0);
+            handler
+                .set_mem_table(&[region], vec![memfd(0x10000)])
+                .unwrap();
+
+            handler.postcopy_advice().unwrap();
+            handler.postcopy_listen().unwrap_err();
+        }
+
+        #[test]
+        fn test_regions_registered() {
+            let mut handler = new_handler();
+            handler.postcopy_advice().unwrap();
+            handler.postcopy_listen().unwrap();
+
+            let table = VhostUserMemoryRegion::new(0x100000, 0x10000, 0x7000_0000, 0);
+            let bases = handler
+                .set_mem_table(&[table], vec![memfd(0x10000)])
+                .unwrap()
+                .unwrap();
+            let added = VhostUserSingleMemoryRegion::new(0x200000, 0x10000, 0x7100_0000, 0);
+            let added_base = handler
+                .add_mem_region(&added, memfd(0x10000))
+                .unwrap()
+                .unwrap();
+
+            // Both mappings are registered for missing pages.
+            for base in [bases[0], added_base] {
+                assert!(vm_flags(base).iter().any(|flag| flag == "um"));
+            }
+        }
     }
 }
