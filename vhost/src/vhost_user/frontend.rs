@@ -104,11 +104,38 @@ pub trait VhostUserFrontend: VhostBackend {
     fn postcopy_advise(&mut self) -> Result<File>;
 
     /// Sends VHOST_USER_POSTCOPY_LISTEN msg to the backend
-    /// telling it to register its memory regions with
-    /// userfaultfd previously received through the
-    /// [`VhostUserFrontend::postcopy_advise`] call.
+    /// telling it to register the memory regions it maps from
+    /// now on with userfaultfd.
     #[cfg(feature = "postcopy-frontend")]
     fn postcopy_listen(&mut self) -> Result<()>;
+
+    /// Sends VHOST_USER_SET_MEM_TABLE msg to a backend that is
+    /// listening for postcopy. Compared to the "normal"
+    /// set_mem_table, the backend returns the base address of
+    /// the regions in its address space.
+    ///
+    /// [`VhostUserFrontend::postcopy_ack_mem_regions`] must then
+    /// be called, and the vrings must not run until it is.
+    #[cfg(feature = "postcopy-frontend")]
+    fn postcopy_set_mem_table(&mut self, regions: &[VhostUserMemoryRegionInfo])
+        -> Result<Vec<u64>>;
+
+    /// Sends VHOST_USER_ADD_MEM_REG msg to a backend that is
+    /// listening for postcopy, and returns the base address of
+    /// the region in the backend's address space.
+    ///
+    /// [`VhostUserFrontend::postcopy_ack_mem_regions`] must then
+    /// be called, and the vrings must not run until it is.
+    #[cfg(feature = "postcopy-frontend")]
+    fn postcopy_add_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<u64>;
+
+    /// Tells the backend that the frontend is ready to resolve
+    /// faults on the regions sent since the last ack.
+    ///
+    /// `code` is the request of the update being acked:
+    /// VHOST_USER_SET_MEM_TABLE or VHOST_USER_ADD_MEM_REG.
+    #[cfg(feature = "postcopy-frontend")]
+    fn postcopy_ack_mem_regions(&mut self, code: FrontendReq) -> Result<()>;
 
     /// Sends VHOST_USER_POSTCOPY_END msg to the backend
     /// indicating the end of the postcopy process.
@@ -666,6 +693,91 @@ impl VhostUserFrontend for Frontend {
     }
 
     #[cfg(feature = "postcopy-frontend")]
+    fn postcopy_set_mem_table(
+        &mut self,
+        regions: &[VhostUserMemoryRegionInfo],
+    ) -> Result<Vec<u64>> {
+        if regions.is_empty() || regions.len() > MAX_ATTACHED_FD_ENTRIES {
+            return error_code(VhostUserError::InvalidParam);
+        }
+
+        let mut ctx = VhostUserMemoryContext::new();
+        for region in regions.iter() {
+            if region.memory_size == 0 || region.mmap_handle < 0 {
+                return error_code(VhostUserError::InvalidParam);
+            }
+
+            ctx.append(&region.to_region(), region.mmap_handle);
+        }
+
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        let body = VhostUserMemory::new(ctx.regions.len() as u32);
+        // SAFETY: Safe because ctx.regions is a valid Vec() at this point.
+        let (_, payload, _) = unsafe { ctx.regions.align_to::<u8>() };
+        let hdr = node.send_postcopy_mem_request(
+            FrontendReq::SET_MEM_TABLE,
+            &body,
+            payload,
+            Some(ctx.fds.as_slice()),
+        )?;
+
+        let (reply, buf, _) = node.recv_reply_with_payload::<VhostUserMemory>(&hdr)?;
+        if reply.num_regions as usize != ctx.regions.len() {
+            return error_code(VhostUserError::InvalidMessage);
+        }
+        let mut bases = Vec::with_capacity(ctx.regions.len());
+        // The reply has the same size as the request, so it holds one chunk per region.
+        for (chunk, region) in buf
+            .chunks(mem::size_of::<VhostUserMemoryRegion>())
+            .zip(ctx.regions.iter())
+        {
+            let reply = VhostUserMemoryRegion::from_slice(chunk)
+                .ok_or(Error::VhostUserProtocol(VhostUserError::InvalidMessage))?;
+            let (reply_gpa, reply_size) = (reply.guest_phys_addr, reply.memory_size);
+            if reply_gpa != region.guest_phys_addr || reply_size != region.memory_size {
+                return error_code(VhostUserError::InvalidMessage);
+            }
+            bases.push(reply.user_addr);
+        }
+
+        Ok(bases)
+    }
+
+    #[cfg(feature = "postcopy-frontend")]
+    fn postcopy_add_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<u64> {
+        let mut node = self.node();
+        node.check_proto_feature(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS)?;
+        node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
+        if region.memory_size == 0 || region.mmap_handle < 0 {
+            return error_code(VhostUserError::InvalidParam);
+        }
+
+        let body = region.to_single_region();
+        let fds = [region.mmap_handle];
+        let hdr =
+            node.send_postcopy_mem_request(FrontendReq::ADD_MEM_REG, &body, &[], Some(&fds))?;
+
+        let reply = node.recv_reply::<VhostUserSingleMemoryRegion>(&hdr)?;
+        let (reply_gpa, reply_size) = (reply.guest_phys_addr, reply.memory_size);
+        if reply_gpa != region.guest_phys_addr || reply_size != region.memory_size {
+            return error_code(VhostUserError::InvalidMessage);
+        }
+
+        Ok(reply.user_addr)
+    }
+
+    #[cfg(feature = "postcopy-frontend")]
+    fn postcopy_ack_mem_regions(&mut self, code: FrontendReq) -> Result<()> {
+        if !matches!(code, FrontendReq::SET_MEM_TABLE | FrontendReq::ADD_MEM_REG) {
+            return error_code(VhostUserError::InvalidParam);
+        }
+        let mut node = self.node();
+        node.send_postcopy_mem_request(code, &VhostUserU64::new(0), &[], None)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "postcopy-frontend")]
     fn postcopy_end(&mut self) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::PAGEFAULT)?;
@@ -794,6 +906,26 @@ impl FrontendInternal {
         let hdr = self.new_request_header(code, mem::size_of::<VhostUserU64>() as u32);
         self.main_sock.send_message(&hdr, &msg, Some(&[fd]))?;
         Ok(hdr)
+    }
+
+    // Postcopy memory updates are answered with the backend's bases and acked by the frontend,
+    // so they must not ask for a REPLY_ACK.
+    #[cfg(feature = "postcopy-frontend")]
+    fn send_postcopy_mem_request<T: ByteValued>(
+        &mut self,
+        code: FrontendReq,
+        msg: &T,
+        payload: &[u8],
+        fds: Option<&[RawFd]>,
+    ) -> VhostUserResult<VhostUserMsgHeader<FrontendReq>> {
+        let flags = self.hdr_flags.bits() & !VhostUserHeaderFlag::NEED_REPLY.bits();
+        let hdr_flags = mem::replace(
+            &mut self.hdr_flags,
+            VhostUserHeaderFlag::from_bits_retain(flags),
+        );
+        let res = self.send_request_with_payload(code, msg, payload, fds);
+        self.hdr_flags = hdr_flags;
+        res
     }
 
     fn recv_reply<T: ByteValued + Sized + VhostUserMsgValidator + Default>(

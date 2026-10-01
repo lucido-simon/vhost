@@ -4,6 +4,8 @@
 
 ### Added
 - Add a `postcopy-frontend` feature
+- Add `VhostUserFrontend::postcopy_set_mem_table()`, `postcopy_add_mem_region()` and
+  `postcopy_ack_mem_regions()`.
 ### Changed
 - `VhostUserBackendReqHandler::set_mem_table()` and `add_mem_region()` (and their
   `VhostUserBackendReqHandlerMut` counterparts) return the bases of the backend's mappings while
